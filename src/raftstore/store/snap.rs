@@ -3,8 +3,9 @@ use std::fmt::{self, Formatter, Display};
 use std::fs::{self, File, OpenOptions, Metadata};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use crc::crc32::{self, Digest, Hasher32};
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
@@ -12,6 +13,11 @@ use protobuf::Message;
 
 use kvproto::raftpb::Snapshot;
 use kvproto::raft_serverpb::RaftSnapshotData;
+use util::worker::Worker;
+use util::HandyRwLock;
+use raftstore::Result;
+use super::worker::{SnapTask, SnapRunner};
+use super::RaftStorage;
 
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -73,7 +79,10 @@ pub struct SnapFile {
 }
 
 impl SnapFile {
-    fn new<T: Into<PathBuf>>(snap_dir: T, is_sending: bool, key: &SnapKey) -> io::Result<SnapFile> {
+    pub fn new<T: Into<PathBuf>>(snap_dir: T,
+                                 is_sending: bool,
+                                 key: &SnapKey)
+                                 -> io::Result<SnapFile> {
         let mut file_path = snap_dir.into();
         if !file_path.exists() {
             try!(fs::create_dir_all(file_path.as_path()));
@@ -212,11 +221,22 @@ impl SnapEntry {
     }
 }
 
+#[derive(PartialEq, Debug)]
+pub enum SnapState {
+    Generating(u8),
+    Snap(Snapshot),
+    Failed(u8),
+}
+
+const MAX_SNAP_TRY_CNT: u8 = 5;
+
 /// `SnapManagerCore` trace all current processing snapshots.
 pub struct SnapManagerCore {
     // directory to store snapfile.
     base: String,
     registry: HashMap<SnapKey, SnapEntry>,
+    snaps: HashMap<u64, Arc<RwLock<SnapState>>>,
+    snap_worker: Mutex<Worker<SnapTask>>,
 }
 
 impl SnapManagerCore {
@@ -224,10 +244,22 @@ impl SnapManagerCore {
         SnapManagerCore {
             base: path.into(),
             registry: map![],
+            snaps: map![],
+            snap_worker: Mutex::new(Worker::new("snapshot worker")),
         }
     }
 
-    pub fn try_recover(&self) -> io::Result<()> {
+    pub fn start(&mut self) -> Result<()> {
+        box_try!(self.snap_worker.lock().unwrap().start(SnapRunner::new(&self.base)));
+        try!(self.try_recover());
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> thread::Result<()> {
+        self.snap_worker.lock().unwrap().stop()
+    }
+
+    fn try_recover(&self) -> io::Result<()> {
         let path = Path::new(&self.base);
         if !path.exists() {
             try!(fs::create_dir_all(path));
@@ -246,6 +278,60 @@ impl SnapManagerCore {
             // TODO: resume applying when suitable
         }
         Ok(())
+    }
+
+    pub fn gen_snap(&mut self, region_id: u64, store: RaftStorage) -> Result<Option<Snapshot>> {
+        // TODO: simplify this function when snapshot's lifetime is removed.
+        // don't try to lock store, otherwise it may deadlock.
+        let res;
+        match self.snaps.entry(region_id) {
+            Entry::Occupied(mut e) => {
+                let mut next_try_cnt = 0;
+                match *e.get().rl() {
+                    SnapState::Generating(_) => return Ok(None),
+                    SnapState::Failed(cnt) => {
+                        if cnt >= MAX_SNAP_TRY_CNT {
+                            return Err(box_err!("failed to generate snap after {} tries", cnt));
+                        }
+                        next_try_cnt = cnt + 1;
+                    }
+                    SnapState::Snap(_) => {}
+                }
+
+                if next_try_cnt > 0 {
+                    let state = Arc::new(RwLock::new(SnapState::Generating(next_try_cnt)));
+                    res = Err(state.clone());
+                    e.insert(state);
+                } else {
+                    if let SnapState::Snap(s) = Arc::try_unwrap(e.remove())
+                        .unwrap()
+                        .into_inner()
+                        .unwrap() {
+                        res = Ok(s);
+                    } else {
+                        unreachable!();
+                    }
+                }
+            }
+            Entry::Vacant(e) => {
+                let state = Arc::new(RwLock::new(SnapState::Generating(1)));
+                res = Err(state.clone());
+                e.insert(state);
+            }
+        };
+
+        match res {
+            Ok(s) => {
+                let key = SnapKey::from_region_snap(region_id, &s);
+                self.register(key, true);
+                Ok(Some(s))
+            }
+            Err(s) => {
+                let t = SnapTask::new(region_id, store, s);
+                box_try!(self.snap_worker.lock().unwrap().schedule(t));
+                Ok(None)
+            }
+        }
     }
 
     #[inline]

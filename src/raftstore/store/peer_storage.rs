@@ -14,7 +14,7 @@
 use std::sync::{self, Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::io::{Seek, SeekFrom};
 use std::fs::File;
-use std::{error, mem};
+use std::error;
 use std::time::Instant;
 
 use rocksdb::{DB, WriteBatch, Writable};
@@ -38,18 +38,8 @@ use super::{SnapFile, SnapKey, SnapManager};
 // so that we can force the follower peer to sync the snapshot first.
 pub const RAFT_INIT_LOG_TERM: u64 = 5;
 pub const RAFT_INIT_LOG_INDEX: u64 = 5;
-const MAX_SNAP_TRY_CNT: u8 = 5;
 
 pub type Ranges = Vec<(Vec<u8>, Vec<u8>)>;
-
-#[derive(PartialEq, Debug)]
-pub enum SnapState {
-    Relax,
-    Pending,
-    Generating,
-    Snap(Snapshot),
-    Failed,
-}
 
 pub struct PeerStorage {
     engine: Arc<DB>,
@@ -61,9 +51,7 @@ pub struct PeerStorage {
     // 1, a truncated state preceded the first log entry.
     // 2, a dummy entry for the start point of the empty log.
     pub truncated_state: RaftTruncatedState,
-    pub snap_state: SnapState,
     snap_mgr: SnapManager,
-    snap_tried_cnt: u8,
 }
 
 fn storage_error<E>(error: E) -> raft::Error
@@ -104,8 +92,6 @@ impl PeerStorage {
             last_index: 0,
             applied_index: 0,
             truncated_state: RaftTruncatedState::new(),
-            snap_state: SnapState::Relax,
-            snap_tried_cnt: 0,
             snap_mgr: snap_mgr,
         };
 
@@ -243,29 +229,6 @@ impl PeerStorage {
 
     pub fn raw_snapshot(&self) -> RocksDbSnapshot {
         self.engine.snapshot()
-    }
-
-    pub fn snapshot(&mut self) -> raft::Result<Snapshot> {
-        if let SnapState::Relax = self.snap_state {
-            info!("requesting snapshot on {}...", self.get_region_id());
-            self.snap_tried_cnt = 0;
-            self.snap_state = SnapState::Pending;
-        } else if let SnapState::Snap(_) = self.snap_state {
-            match mem::replace(&mut self.snap_state, SnapState::Relax) {
-                SnapState::Snap(s) => return Ok(s),
-                _ => unreachable!(),
-            }
-        } else if let SnapState::Failed = self.snap_state {
-            if self.snap_tried_cnt >= MAX_SNAP_TRY_CNT {
-                return Err(raft::Error::Store(box_err!("failed to get snapshot after {} times",
-                                                       self.snap_tried_cnt)));
-            }
-            self.snap_tried_cnt += 1;
-            warn!("snapshot generating failed, retry {} time",
-                  self.snap_tried_cnt);
-            self.snap_state = SnapState::Pending;
-        }
-        Err(raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable))
     }
 
     // Append the given entries to the raft log using previous last index or self.last_index.
@@ -579,9 +542,9 @@ fn build_snap_file(f: &mut SnapFile,
     Ok(())
 }
 
-pub fn do_snapshot(mgr: SnapManager,
+pub fn do_snapshot(snap_file: &mut SnapFile,
                    snap: &RocksDbSnapshot,
-                   key: SnapKey,
+                   key: &SnapKey,
                    ranges: Ranges)
                    -> raft::Result<Snapshot> {
     debug!("begin to generate a snapshot for region {}", key.region_id);
@@ -611,7 +574,6 @@ pub fn do_snapshot(mgr: SnapManager,
     let mut snap_data = RaftSnapshotData::new();
     snap_data.set_region(region);
 
-    let mut snap_file = try!(mgr.rl().get_snap_file(&key, true));
     if snap_file.exists() {
         if let Err(e) = snap_file.validate() {
             error!("file {} is invalid, will regenerate: {:?}",
@@ -619,10 +581,10 @@ pub fn do_snapshot(mgr: SnapManager,
                    e);
             try!(snap_file.try_delete());
             try!(snap_file.init());
-            try!(build_snap_file(&mut snap_file, snap, key.region_id, ranges));
+            try!(build_snap_file(snap_file, snap, key.region_id, ranges));
         }
     } else {
-        try!(build_snap_file(&mut snap_file, snap, key.region_id, ranges));
+        try!(build_snap_file(snap_file, snap, key.region_id, ranges));
     }
 
     let len = try!(snap_file.meta()).len();
@@ -697,21 +659,31 @@ impl Storage for RaftStorage {
     }
 
     fn snapshot(&self) -> raft::Result<Snapshot> {
-        self.wl().snapshot()
+        let storage = self.clone();
+        let region_id = storage.wl().get_region_id();
+        let inner = self.wl();
+        let mut snap_mgr = inner.snap_mgr.wl();
+        // TODO: check snapshot index and reject stale snapshot.
+        match try!(snap_mgr.gen_snap(region_id, storage)) {
+            None => Err(raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable)),
+            Some(s) => Ok(s),
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use std::sync::*;
-    use std::io;
+    use std::{io, thread};
     use std::fs::File;
+    use std::time::Duration;
     use rocksdb::*;
     use kvproto::raftpb::{Entry, ConfState, Snapshot};
     use kvproto::raft_serverpb::RaftSnapshotData;
     use raft::{StorageError, Error as RaftError};
     use tempdir::*;
     use protobuf;
+    use raft::Storage;
     use raftstore::store::*;
     use util::codec::number::NumberEncoder;
     use util::HandyRwLock;
@@ -842,7 +814,8 @@ mod test {
         let applied_id = s.rl().load_applied_index(&raw_snap).unwrap();
         let term = s.rl().term(applied_id).unwrap();
         let key = SnapKey::new(s.rl().get_region_id(), term, applied_id);
-        do_snapshot(mgr, &raw_snap, key, key_ranges).unwrap()
+        let mut snap_file = mgr.wl().get_snap_file(&key, true).unwrap();
+        do_snapshot(&mut snap_file, &raw_snap, &key, key_ranges).unwrap()
     }
 
     #[test]
@@ -854,15 +827,27 @@ mod test {
         let td = TempDir::new("tikv-store-test").unwrap();
         let snap_dir = TempDir::new("snap_dir").unwrap();
         let mgr = new_snap_mgr(snap_dir.path().to_str().unwrap());
+        mgr.wl().start().unwrap();
         let s = new_storage_from_ents(mgr, &td, &ents);
-        let snap = s.wl().snapshot();
+        let mut snap_res = s.snapshot();
         let unavailable = RaftError::Store(StorageError::SnapshotTemporarilyUnavailable);
-        assert_eq!(snap.unwrap_err(), unavailable);
-        assert_eq!(s.wl().snap_state, SnapState::Pending);
+        assert_eq!(snap_res.unwrap_err(), unavailable);
 
-        s.wl().snap_state = SnapState::Generating;
-        assert_eq!(s.wl().snapshot().unwrap_err(), unavailable);
-        assert_eq!(s.rl().snap_state, SnapState::Generating);
+        let mut try_cnt = 0;
+        loop {
+            snap_res = s.snapshot();
+            if snap_res.is_ok() {
+                break;
+            }
+
+            if try_cnt >= 100 {
+                panic!("failed to genenrate snapshot");
+            } else {
+                thread::sleep(Duration::from_millis(20));
+            }
+
+            try_cnt += 1;
+        }
 
         let snap_dir = TempDir::new("snap").unwrap();
         let snap = get_snap(&s, new_snap_mgr(snap_dir.path().to_str().unwrap()));
@@ -875,8 +860,7 @@ mod test {
         assert_eq!(data.get_region().get_id(), 1);
         assert_eq!(data.get_region().get_peers().len(), 1);
 
-        s.wl().snap_state = SnapState::Snap(snap.clone());
-        assert_eq!(s.wl().snapshot(), Ok(snap));
+        assert_eq!(snap_res, Ok(snap));
     }
 
     #[test]

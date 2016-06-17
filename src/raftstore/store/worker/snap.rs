@@ -11,29 +11,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use raftstore::store::{self, RaftStorage, SnapState, SnapManager, SnapKey};
+use raftstore::store::{self, RaftStorage, SnapState, SnapKey, SnapFile};
 
 use std::fmt::{self, Formatter, Display};
 use std::error;
 use std::time::Instant;
+use std::sync::{Arc, RwLock};
 
 use util::worker::Runnable;
 use util::HandyRwLock;
 
 /// Snapshot generating task.
 pub struct Task {
+    region_id: u64,
     storage: RaftStorage,
+    snap_state: Arc<RwLock<SnapState>>,
 }
 
 impl Task {
-    pub fn new(storage: RaftStorage) -> Task {
-        Task { storage: storage }
+    pub fn new(region_id: u64, storage: RaftStorage, snap_state: Arc<RwLock<SnapState>>) -> Task {
+        Task {
+            region_id: region_id,
+            storage: storage,
+            snap_state: snap_state,
+        }
     }
 }
 
 impl Display for Task {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Snapshot Task for {}", self.storage.rl().get_region_id())
+        write!(f, "Snapshot Task for {}", self.region_id)
     }
 }
 
@@ -50,12 +57,12 @@ quick_error! {
 }
 
 pub struct Runner {
-    mgr: SnapManager,
+    base_dir: String,
 }
 
 impl Runner {
-    pub fn new(mgr: SnapManager) -> Runner {
-        Runner { mgr: mgr }
+    pub fn new(base_dir: &str) -> Runner {
+        Runner { base_dir: base_dir.to_owned() }
     }
 
     fn generate_snap(&self, task: &Task) -> Result<(), Error> {
@@ -64,6 +71,7 @@ impl Runner {
         let raw_snap;
         let ranges;
         let key;
+        let mut snap_file;
 
         {
             let storage = task.storage.rl();
@@ -72,16 +80,11 @@ impl Runner {
             let applied_idx = box_try!(storage.load_applied_index(&raw_snap));
             let term = box_try!(storage.term(applied_idx));
             key = SnapKey::new(storage.get_region_id(), term, applied_idx);
+            snap_file = box_try!(SnapFile::new(self.base_dir.clone(), true, &key));
         }
 
-        self.mgr.wl().register(key.clone(), true);
-        match store::do_snapshot(self.mgr.clone(), &raw_snap, key.clone(), ranges) {
-            Ok(snap) => task.storage.wl().snap_state = SnapState::Snap(snap),
-            Err(e) => {
-                self.mgr.wl().deregister(&key, true);
-                return Err(Error::Other(box e));
-            }
-        }
+        let snap = box_try!(store::do_snapshot(&mut snap_file, &raw_snap, &key, ranges));
+        *task.snap_state.wl() = SnapState::Snap(snap);
         Ok(())
     }
 }
@@ -92,7 +95,9 @@ impl Runnable<Task> for Runner {
         let ts = Instant::now();
         if let Err(e) = self.generate_snap(&task) {
             error!("failed to generate snap: {:?}!!!", e);
-            task.storage.wl().snap_state = SnapState::Failed;
+            if let SnapState::Generating(cnt) = *task.snap_state.rl() {
+                *task.snap_state.wl() = SnapState::Failed(cnt + 1);
+            }
             return;
         }
         metric_incr!("raftstore.generate_snap.success");
