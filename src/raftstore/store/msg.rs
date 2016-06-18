@@ -131,6 +131,7 @@ impl SendCh {
     }
 
     pub fn send(&self, msg: Msg) -> Result<()> {
+        metric_incr!("raftstore.event.produce");
         try!(send_msg(&self.ch, msg));
         Ok(())
     }

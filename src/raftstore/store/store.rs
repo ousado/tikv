@@ -926,6 +926,7 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
     type Message = Msg;
 
     fn notify(&mut self, event_loop: &mut EventLoop<Self>, msg: Msg) {
+        metric_incr!("raftstore.event.consume");
         let t = SlowTimer::new();
         let msg_str = format!("{:?}", msg);
         match msg {
